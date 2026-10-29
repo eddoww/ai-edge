@@ -302,16 +302,20 @@ func mustBoundary(t *testing.T, contentType string) string {
 
 func TestRetryDelay(t *testing.T) {
 	header := http.Header{"Retry-After": []string{"2"}}
-	if got := retryDelay(header); got != 2*time.Second {
-		t.Fatalf("seconds form: got %v", got)
+	if got, ok := retryDelay(header); !ok || got != 2*time.Second {
+		t.Fatalf("seconds form: got %v ok=%v", got, ok)
 	}
 	header = http.Header{"Retry-After": []string{"-5"}}
-	if got := retryDelay(header); got != 0 {
-		t.Fatalf("negative must clamp to 0, got %v", got)
+	if got, ok := retryDelay(header); !ok || got != 0 {
+		t.Fatalf("negative must clamp to 0, got %v ok=%v", got, ok)
 	}
 	header = http.Header{"Retry-After": []string{time.Now().Add(2500 * time.Millisecond).UTC().Format(http.TimeFormat)}}
-	if got := retryDelay(header); got <= 0 || got > 5*time.Second {
-		t.Fatalf("HTTP-date form: got %v", got)
+	if got, ok := retryDelay(header); !ok || got <= 0 || got > 5*time.Second {
+		t.Fatalf("HTTP-date form: got %v ok=%v", got, ok)
+	}
+	header = http.Header{"Retry-After": []string{"60"}}
+	if _, ok := retryDelay(header); ok {
+		t.Fatal("a delay beyond the retry budget must not be retried early")
 	}
 }
 

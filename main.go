@@ -18,6 +18,7 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/textproto"
@@ -26,6 +27,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -114,6 +116,19 @@ func main() {
 		// No write timeout: proxied generations and SSE responses can be long.
 	}
 
+	// Shutdown does not close hijacked (WebSocket) connections; track them so
+	// they are closed once HTTP draining finishes instead of at hard exit.
+	var hijackedMu sync.Mutex
+	hijacked := map[net.Conn]struct{}{}
+	server.ConnState = func(conn net.Conn, state http.ConnState) {
+		if state != http.StateHijacked {
+			return
+		}
+		hijackedMu.Lock()
+		hijacked[conn] = struct{}{}
+		hijackedMu.Unlock()
+	}
+
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	shutdownDone := make(chan struct{})
@@ -123,8 +138,8 @@ func main() {
 		log.Printf("shutdown requested; draining for up to %s", shutdownGrace)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
-		// Shutdown drains in-flight HTTP requests. Hijacked WebSocket
-		// connections are closed when the process exits after the grace period.
+		// Shutdown drains in-flight HTTP requests; hijacked WebSocket
+		// connections are closed below, once draining finishes.
 		if errShutdown := server.Shutdown(shutdownCtx); errShutdown != nil {
 			log.Printf("shutdown error: %v", errShutdown)
 		}
@@ -136,6 +151,11 @@ func main() {
 	}
 	// Wait for the drain: returning here would kill the shutdown goroutine.
 	<-shutdownDone
+	hijackedMu.Lock()
+	for conn := range hijacked {
+		_ = conn.Close()
+	}
+	hijackedMu.Unlock()
 	log.Printf("ai-edge stopped")
 }
 
@@ -437,10 +457,15 @@ func scanFormField(body []byte, boundary, field string) (bool, error) {
 			_ = part.Close()
 			continue
 		}
-		raw, errRead := io.ReadAll(io.LimitReader(part, 1024))
+		// Read the whole field (bounded) so a long value is not mistaken for
+		// blank; an oversized value counts as present and is left untouched.
+		raw, errRead := io.ReadAll(io.LimitReader(part, 64<<10))
 		_ = part.Close()
 		if errRead != nil {
 			return false, errRead
+		}
+		if len(raw) >= 64<<10 {
+			return true, nil
 		}
 		if strings.TrimSpace(string(raw)) != "" {
 			return true, nil
@@ -539,7 +564,12 @@ func doWithRetry(ctx context.Context, build func() (*http.Request, error)) (int,
 			return lastStatus, lastHeaders, lastBody, nil
 		}
 		if attempt < attempts-1 {
-			delay := retryDelay(resp.Header)
+			delay, okRetry := retryDelay(resp.Header)
+			if !okRetry {
+				// The upstream asked for more delay than the retry budget:
+				// return its response instead of retrying early.
+				return lastStatus, lastHeaders, lastBody, nil
+			}
 			if delay <= 0 {
 				continue
 			}
@@ -555,44 +585,46 @@ func doWithRetry(ctx context.Context, build func() (*http.Request, error)) (int,
 	return lastStatus, lastHeaders, lastBody, nil
 }
 
-func retryDelay(header http.Header) time.Duration {
+// retryDelay returns the requested wait and whether a retry is still worthwhile.
+// A delay beyond the retry budget returns false: retrying early would ignore the
+// upstream's guidance, so the response is returned instead.
+func retryDelay(header http.Header) (time.Duration, bool) {
+	const maxDelay = 5 * time.Second
+	parse := func(delay time.Duration) (time.Duration, bool) {
+		if delay <= 0 {
+			return 0, true
+		}
+		if delay > maxDelay {
+			return 0, false
+		}
+		return delay, true
+	}
 	if raw := strings.TrimSpace(header.Get("Retry-After")); raw != "" {
 		if seconds, errAtoi := strconv.Atoi(raw); errAtoi == nil {
-			if seconds <= 0 {
-				return 0
-			}
 			if seconds > 3600 {
 				seconds = 3600
 			}
-			return clampDelay(time.Duration(seconds) * time.Second)
+			if seconds <= 0 {
+				return 0, true
+			}
+			return parse(time.Duration(seconds) * time.Second)
 		}
 		if when, errParse := http.ParseTime(raw); errParse == nil {
-			return clampDelay(time.Until(when))
+			return parse(time.Until(when))
 		}
 	}
 	if raw := strings.TrimSpace(header.Get("Retry-After-Ms")); raw != "" {
 		if millis, errAtoi := strconv.Atoi(raw); errAtoi == nil {
-			if millis <= 0 {
-				return 0
-			}
 			if millis > 3_600_000 {
 				millis = 3_600_000
 			}
-			return clampDelay(time.Duration(millis) * time.Millisecond)
+			if millis <= 0 {
+				return 0, true
+			}
+			return parse(time.Duration(millis) * time.Millisecond)
 		}
 	}
-	return 300 * time.Millisecond
-}
-
-func clampDelay(delay time.Duration) time.Duration {
-	const maxDelay = 5 * time.Second
-	if delay <= 0 {
-		return 0
-	}
-	if delay > maxDelay {
-		return maxDelay
-	}
-	return delay
+	return 300 * time.Millisecond, true
 }
 
 func copyResponse(w http.ResponseWriter, status int, headers http.Header, body []byte, upstream string) {
