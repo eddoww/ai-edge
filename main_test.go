@@ -314,3 +314,33 @@ func TestRetryDelay(t *testing.T) {
 		t.Fatalf("HTTP-date form: got %v", got)
 	}
 }
+
+func TestMultipartBlankModelReplacedNotDuplicated(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "")
+	part, _ := writer.CreateFormFile("file", "a.webm")
+	_, _ = part.Write([]byte("x"))
+	_ = writer.Close()
+
+	rewritten, contentType, errRewrite := withDefaultFormField(body.Bytes(), writer.FormDataContentType(), "model", "whisper-large-v3")
+	if errRewrite != nil {
+		t.Fatalf("rewrite: %v", errRewrite)
+	}
+	reader := multipart.NewReader(bytes.NewReader(rewritten), mustBoundary(t, contentType))
+	models := []string{}
+	for {
+		part, errNext := reader.NextPart()
+		if errNext != nil {
+			break
+		}
+		if part.FormName() == "model" {
+			value, _ := io.ReadAll(part)
+			models = append(models, string(value))
+		}
+		_ = part.Close()
+	}
+	if len(models) != 1 || models[0] != "whisper-large-v3" {
+		t.Fatalf("expected exactly one model part, got %v", models)
+	}
+}

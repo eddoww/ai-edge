@@ -8,7 +8,7 @@ CLIProxyAPI plugins cannot add `/v1/*` routes, so three things live here instead
 | --- | --- | --- |
 | `POST /v1/systemone` | TypeSafe `api.typesafe.ai` | Jev / System One typed questions. Defaults `model` to `jev-latest`; retries 429/529. |
 | `POST /v1/embeddings` | Mistral `/v1/embeddings` | Maps OpenAI-style model names to `mistral-embed`; keeps `mistral-*` models as requested. |
-| `POST /v1/audio/transcriptions` | Groq `/audio/transcriptions` | Byte-identical multipart passthrough when `model` is present; otherwise rebuilt with the model part added, preserving part headers and order. Uploads are capped at 25 MiB and bounded by a concurrency semaphore. |
+| `POST /v1/audio/transcriptions` | Groq `/audio/transcriptions` | The original bytes are reused unchanged when a non-blank `model` field is present; otherwise the body is rebuilt once with the model part added, preserving existing part headers, encoding and order. Uploads are capped at 25 MiB and bounded by a concurrency semaphore. |
 
 Everything else is reverse-proxied to `CPA_UPSTREAM`, including SSE streaming and WebSocket
 upgrades (`/v1/realtime`, `/v1/live`), so clients keep a single base URL. Standard reverse-proxy

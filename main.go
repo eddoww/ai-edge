@@ -114,13 +114,17 @@ func main() {
 		// No write timeout: proxied generations and SSE responses can be long.
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownDone)
+		<-signals
 		log.Printf("shutdown requested; draining for up to %s", shutdownGrace)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
+		// Shutdown drains in-flight HTTP requests. Hijacked WebSocket
+		// connections are closed when the process exits after the grace period.
 		if errShutdown := server.Shutdown(shutdownCtx); errShutdown != nil {
 			log.Printf("shutdown error: %v", errShutdown)
 		}
@@ -130,6 +134,8 @@ func main() {
 	if errListen := server.ListenAndServe(); errListen != nil && !errors.Is(errListen, http.ErrServerClosed) {
 		log.Fatalf("server failed: %v", errListen)
 	}
+	// Wait for the drain: returning here would kill the shutdown goroutine.
+	<-shutdownDone
 	log.Printf("ai-edge stopped")
 }
 
@@ -386,12 +392,17 @@ func withDefaultFormField(body []byte, contentType, field, value string) ([]byte
 
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
 	for {
-		source, errNext := reader.NextPart()
+		source, errNext := reader.NextRawPart()
 		if errors.Is(errNext, io.EOF) {
 			break
 		}
 		if errNext != nil {
 			return nil, "", errNext
+		}
+		// Any part with this name is blank here, otherwise we would not rewrite.
+		if source.FormName() == field && source.FileName() == "" {
+			_ = source.Close()
+			continue
 		}
 		copied := make(textproto.MIMEHeader, len(source.Header))
 		for key, values := range source.Header {
@@ -415,18 +426,18 @@ func withDefaultFormField(body []byte, contentType, field, value string) ([]byte
 func scanFormField(body []byte, boundary, field string) (bool, error) {
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
 	for {
-		part, errNext := reader.NextPart()
+		part, errNext := reader.NextRawPart()
 		if errors.Is(errNext, io.EOF) {
 			return false, nil
 		}
 		if errNext != nil {
 			return false, errNext
 		}
-		if part.FormName() != field {
+		if part.FormName() != field || part.FileName() != "" {
 			_ = part.Close()
 			continue
 		}
-		raw, errRead := io.ReadAll(io.LimitReader(part, 512))
+		raw, errRead := io.ReadAll(io.LimitReader(part, 1024))
 		_ = part.Close()
 		if errRead != nil {
 			return false, errRead
@@ -550,6 +561,9 @@ func retryDelay(header http.Header) time.Duration {
 			if seconds <= 0 {
 				return 0
 			}
+			if seconds > 3600 {
+				seconds = 3600
+			}
 			return clampDelay(time.Duration(seconds) * time.Second)
 		}
 		if when, errParse := http.ParseTime(raw); errParse == nil {
@@ -560,6 +574,9 @@ func retryDelay(header http.Header) time.Duration {
 		if millis, errAtoi := strconv.Atoi(raw); errAtoi == nil {
 			if millis <= 0 {
 				return 0
+			}
+			if millis > 3_600_000 {
+				millis = 3_600_000
 			}
 			return clampDelay(time.Duration(millis) * time.Millisecond)
 		}
