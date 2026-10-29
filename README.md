@@ -8,10 +8,11 @@ CLIProxyAPI plugins cannot add `/v1/*` routes, so three things live here instead
 | --- | --- | --- |
 | `POST /v1/systemone` | TypeSafe `api.typesafe.ai` | Jev / System One typed questions. Defaults `model` to `jev-latest`; retries 429/529. |
 | `POST /v1/embeddings` | Mistral `/v1/embeddings` | Maps OpenAI-style model names to `mistral-embed`; keeps `mistral-*` models as requested. |
-| `POST /v1/audio/transcriptions` | Groq `/audio/transcriptions` | Multipart passthrough; injects `whisper-large-v3` when the client omits `model`. |
+| `POST /v1/audio/transcriptions` | Groq `/audio/transcriptions` | Byte-identical multipart passthrough when `model` is present; otherwise rebuilt with the model part added, preserving part headers and order. Uploads are capped at 25 MiB and bounded by a concurrency semaphore. |
 
-Everything else is reverse-proxied to `CPA_UPSTREAM` unchanged, including SSE streaming, so clients
-keep a single base URL.
+Everything else is reverse-proxied to `CPA_UPSTREAM`, including SSE streaming and WebSocket
+upgrades (`/v1/realtime`, `/v1/live`), so clients keep a single base URL. Standard reverse-proxy
+header rewriting applies to the proxied path.
 
 ## Auth
 
@@ -32,8 +33,10 @@ constant-time. Proxied requests are left untouched so CLIProxyAPI keeps enforcin
 | `MISTRAL_EMBED_MODEL` | `mistral-embed` | Embedding model. |
 | `GROQ_API_KEY` | — | Enables `/v1/audio/transcriptions`. |
 | `GROQ_STT_MODEL` | `whisper-large-v3` | Default transcription model. |
+| `MAX_CONCURRENT_TRANSCRIPTIONS` | `2` | Buffered uploads allowed at once. |
 
-Missing credentials disable only the affected endpoint; the proxy keeps working.
+Missing provider credentials disable only the affected endpoint; the proxy keeps working. A missing
+`CPA_API_KEY` is fatal because it is the key the added endpoints authenticate against.
 
 ## Build
 

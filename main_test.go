@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
+	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testConfig(overrides ...func(*config)) config {
@@ -208,5 +213,104 @@ func TestWithDefaultFormFieldKeepsExplicitModel(t *testing.T) {
 	}
 	if !bytes.Equal(rewritten, body.Bytes()) {
 		t.Fatal("explicit model must not be rewritten")
+	}
+}
+
+func TestStatusRecorderSupportsHijackViaUnwrap(t *testing.T) {
+	underlying := &hijackRecorder{ResponseWriter: httptest.NewRecorder()}
+	wrapped := &statusRecorder{ResponseWriter: underlying, status: 200}
+
+	conn, _, errHijack := http.NewResponseController(wrapped).Hijack()
+	if errHijack != nil {
+		t.Fatalf("hijack through the logging wrapper failed: %v", errHijack)
+	}
+	if conn == nil {
+		t.Fatal("expected a hijacked connection")
+	}
+}
+
+type hijackRecorder struct {
+	http.ResponseWriter
+	hijacked bool
+}
+
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	client, server := net.Pipe()
+	go func() { _ = server.Close() }()
+	return client, bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client)), nil
+}
+
+func TestEmbeddingsRejectsJSONNull(t *testing.T) {
+	cfg := testConfig()
+	handler := requireKey(cfg, handleEmbeddings(cfg))
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader("null"))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for JSON null, got %d", rec.Code)
+	}
+}
+
+func TestMultipartRewritePreservesPartHeaders(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", `form-data; name="file"; filename="clip.webm"`)
+	header.Set("Content-Type", "audio/webm")
+	part, _ := writer.CreatePart(header)
+	_, _ = part.Write([]byte("audio-bytes"))
+	_ = writer.WriteField("language", "en")
+	_ = writer.Close()
+
+	rewritten, contentType, errRewrite := withDefaultFormField(body.Bytes(), writer.FormDataContentType(), "model", "whisper-large-v3")
+	if errRewrite != nil {
+		t.Fatalf("rewrite: %v", errRewrite)
+	}
+	if !strings.Contains(string(rewritten), "audio/webm") {
+		t.Fatal("file part content type must be preserved")
+	}
+	reader := multipart.NewReader(bytes.NewReader(rewritten), mustBoundary(t, contentType))
+	foundModel, foundLanguage := false, false
+	for {
+		part, errNext := reader.NextPart()
+		if errNext != nil {
+			break
+		}
+		switch part.FormName() {
+		case "model":
+			foundModel = true
+		case "language":
+			foundLanguage = true
+		}
+		_ = part.Close()
+	}
+	if !foundModel || !foundLanguage {
+		t.Fatalf("expected model and language parts, got model=%v language=%v", foundModel, foundLanguage)
+	}
+}
+
+func mustBoundary(t *testing.T, contentType string) string {
+	t.Helper()
+	_, params, errParse := mime.ParseMediaType(contentType)
+	if errParse != nil || params["boundary"] == "" {
+		t.Fatalf("bad content type %q: %v", contentType, errParse)
+	}
+	return params["boundary"]
+}
+
+func TestRetryDelay(t *testing.T) {
+	header := http.Header{"Retry-After": []string{"2"}}
+	if got := retryDelay(header); got != 2*time.Second {
+		t.Fatalf("seconds form: got %v", got)
+	}
+	header = http.Header{"Retry-After": []string{"-5"}}
+	if got := retryDelay(header); got != 0 {
+		t.Fatalf("negative must clamp to 0, got %v", got)
+	}
+	header = http.Header{"Retry-After": []string{time.Now().Add(2500 * time.Millisecond).UTC().Format(http.TimeFormat)}}
+	if got := retryDelay(header); got <= 0 || got > 5*time.Second {
+		t.Fatalf("HTTP-date form: got %v", got)
 	}
 }
