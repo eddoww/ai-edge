@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const edgeVersion = "0.2.1"
+const edgeVersion = "0.2.3"
 
 // endpointSettings describe one added endpoint that can be toggled and pointed
 // at a different upstream model from the dashboard.
@@ -71,14 +71,21 @@ func (s edgeSettings) normalized() (edgeSettings, error) {
 // settingsStore keeps the runtime settings and persists changes to a file so
 // they survive restarts.
 type settingsStore struct {
-	mu       sync.RWMutex
-	current  edgeSettings
-	path     string
-	modTime  time.Time
-	lastStat time.Time
+	mu      sync.RWMutex
+	current edgeSettings
+	path    string
+	modTime time.Time
 }
 
 func newSettingsStore(path string, defaults edgeSettings) *settingsStore {
+	if normalized, errNormalize := defaults.normalized(); errNormalize == nil {
+		defaults = normalized
+	} else {
+		log.Printf("environment defaults rejected (%v); clamping", errNormalize)
+		if defaults.Transcriptions.MaxConcurrent < 1 || defaults.Transcriptions.MaxConcurrent > 16 {
+			defaults.Transcriptions.MaxConcurrent = defaultTranscriptions
+		}
+	}
 	store := &settingsStore{current: defaults, path: path}
 	if path == "" {
 		return store
@@ -106,31 +113,36 @@ func newSettingsStore(path string, defaults edgeSettings) *settingsStore {
 	return store
 }
 
-// get returns the current settings. When several replicas share the file, a
-// change made on one pod is picked up by the others within a second.
+// get returns the cached settings. It never touches the filesystem: an NFS
+// outage must not stall requests that could be served from memory.
 func (s *settingsStore) get() edgeSettings {
-	s.reloadIfChanged()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.current
 }
 
-func (s *settingsStore) reloadIfChanged() {
+// startWatcher polls the settings file so replicas converge. Polling happens on
+// this goroutine, never on a request path.
+func (s *settingsStore) startWatcher(interval time.Duration) {
 	if s.path == "" {
 		return
 	}
-	s.mu.RLock()
-	lastStat := s.lastStat
-	knownMod := s.modTime
-	s.mu.RUnlock()
-	if time.Since(lastStat) < time.Second {
-		return
+	if interval <= 0 {
+		interval = 2 * time.Second
 	}
-	info, errStat := os.Stat(s.path)
-	if errStat != nil || info.ModTime().Equal(knownMod) {
-		s.mu.Lock()
-		s.lastStat = time.Now()
-		s.mu.Unlock()
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			s.reload()
+		}
+	}()
+}
+
+// reload re-reads the file and adopts any change. It deliberately does not rely
+// on mtime: NFS attribute caching can hide a fresh mtime from the other replica.
+// The file is tiny, and the watcher runs off the request path.
+func (s *settingsStore) reload() {
+	if s.path == "" {
 		return
 	}
 	raw, errRead := os.ReadFile(s.path)
@@ -146,9 +158,12 @@ func (s *settingsStore) reloadIfChanged() {
 		return
 	}
 	s.mu.Lock()
-	s.current = normalized
-	s.modTime = info.ModTime()
-	s.lastStat = time.Now()
+	if s.current != normalized {
+		s.current = normalized
+	}
+	if info, errStat := os.Stat(s.path); errStat == nil {
+		s.modTime = info.ModTime()
+	}
 	s.mu.Unlock()
 }
 
@@ -173,11 +188,28 @@ func (s *settingsStore) save(next edgeSettings) error {
 		if errMkdir := os.MkdirAll(filepath.Dir(s.path), 0o755); errMkdir != nil {
 			return errMkdir
 		}
-		tmp := s.path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+		tmp, errTemp := os.CreateTemp(filepath.Dir(s.path), ".edge-config-*.tmp")
+		if errTemp != nil {
+			return errTemp
+		}
+		tmpName := tmp.Name()
+		defer func() { _ = os.Remove(tmpName) }()
+		if errChmod := tmp.Chmod(0o600); errChmod != nil {
+			_ = tmp.Close()
+			return errChmod
+		}
+		if _, errWrite := tmp.Write(raw); errWrite != nil {
+			_ = tmp.Close()
 			return errWrite
 		}
-		if errRename := os.Rename(tmp, s.path); errRename != nil {
+		if errSync := tmp.Sync(); errSync != nil {
+			_ = tmp.Close()
+			return errSync
+		}
+		if errClose := tmp.Close(); errClose != nil {
+			return errClose
+		}
+		if errRename := os.Rename(tmpName, s.path); errRename != nil {
 			return errRename
 		}
 	}
@@ -186,7 +218,6 @@ func (s *settingsStore) save(next edgeSettings) error {
 	if info, errStat := os.Stat(s.path); errStat == nil {
 		s.modTime = info.ModTime()
 	}
-	s.lastStat = time.Now()
 	s.mu.Unlock()
 	return nil
 }
@@ -214,15 +245,6 @@ func (d *dynLimiter) acquire(ctx context.Context) (func(), bool) {
 	case <-ctx.Done():
 		return nil, false
 	}
-}
-
-func (d *dynLimiter) resize(size int) {
-	if size < 1 {
-		size = 1
-	}
-	d.mu.Lock()
-	d.ch = make(chan struct{}, size)
-	d.mu.Unlock()
 }
 
 // requireAdmin guards the dashboard endpoints with the management token.
@@ -287,7 +309,7 @@ func handleAdminConfig(store *settingsStore, limiter *dynLimiter) http.HandlerFu
 				writeError(w, http.StatusBadRequest, "invalid_settings", errSave.Error())
 				return
 			}
-			limiter.resize(store.get().Transcriptions.MaxConcurrent)
+			limiter.ensureCapacity(store.get().Transcriptions.MaxConcurrent)
 			writeJSON(w, http.StatusOK, store.get())
 		default:
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET or PUT required")

@@ -105,6 +105,7 @@ func main() {
 
 	started := time.Now()
 	store := newSettingsStore(cfg.ConfigFile, defaultSettings(cfg))
+	store.startWatcher(2 * time.Second)
 	limiter := newDynLimiter(store.get().Transcriptions.MaxConcurrent)
 
 	mux := http.NewServeMux()

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -115,5 +116,88 @@ func TestDisabledEndpointReturns503(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 for a disabled endpoint, got %d", rec.Code)
+	}
+}
+
+func TestSettingsConvergeAcrossReplicas(t *testing.T) {
+	cfg := adminTestConfig(t)
+	first := newSettingsStore(cfg.ConfigFile, defaultSettings(cfg))
+	second := newSettingsStore(cfg.ConfigFile, defaultSettings(cfg))
+
+	next := first.get()
+	next.Embeddings.Model = "mistral-embed-v2"
+	if errSave := first.save(next); errSave != nil {
+		t.Fatalf("save: %v", errSave)
+	}
+
+	if got := second.get().Embeddings.Model; got == "mistral-embed-v2" {
+		t.Fatal("second replica must not see unsaved state without reloading")
+	}
+	second.reload()
+	if got := second.get().Embeddings.Model; got != "mistral-embed-v2" {
+		t.Fatalf("replica did not converge, got %q", got)
+	}
+}
+
+func TestConcurrentSavesAreAtomic(t *testing.T) {
+	cfg := adminTestConfig(t)
+	store := newSettingsStore(cfg.ConfigFile, defaultSettings(cfg))
+
+	const writers = 8
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		go func(index int) {
+			next := store.get()
+			next.Transcriptions.MaxConcurrent = 1 + index%16
+			errs <- store.save(next)
+		}(i)
+	}
+	for i := 0; i < writers; i++ {
+		if errReceive := <-errs; errReceive != nil {
+			t.Fatalf("concurrent save failed: %v", errReceive)
+		}
+	}
+
+	raw, errRead := os.ReadFile(cfg.ConfigFile)
+	if errRead != nil {
+		t.Fatalf("settings file missing: %v", errRead)
+	}
+	var loaded edgeSettings
+	if errUnmarshal := json.Unmarshal(raw, &loaded); errUnmarshal != nil {
+		t.Fatalf("settings file is corrupt after concurrent saves: %v", errUnmarshal)
+	}
+	entries, _ := filepath.Glob(filepath.Join(filepath.Dir(cfg.ConfigFile), ".edge-config-*.tmp"))
+	if len(entries) != 0 {
+		t.Fatalf("temporary files left behind: %v", entries)
+	}
+}
+
+func TestAdminModelsProxiesCatalog(t *testing.T) {
+	var seenAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"grok-4.7"}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := adminTestConfig(t)
+	cfg.CPAUpstream = upstream.URL
+	cfg.CPAAPIKey = "client-key"
+	handler := requireAdmin(cfg, handleAdminModels(cfg))
+
+	req := httptest.NewRequest(http.MethodGet, "/v8/management/edge-admin/models", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if seenAuth != "Bearer client-key" {
+		t.Fatalf("upstream must use the client key, got %q", seenAuth)
+	}
+	if !strings.Contains(rec.Body.String(), "grok-4.7") {
+		t.Fatalf("model catalog not proxied: %s", rec.Body.String())
 	}
 }
