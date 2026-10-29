@@ -17,6 +17,10 @@ import (
 	"time"
 )
 
+func testStore(cfg config) *settingsStore {
+	return newSettingsStore("", defaultSettings(cfg))
+}
+
 func testConfig(overrides ...func(*config)) config {
 	cfg := loadConfig()
 	cfg.CPAAPIKey = "test-key"
@@ -70,7 +74,7 @@ func TestSystemOneDefaultsModelAndForwardsKey(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := testConfig(func(c *config) { c.TypeSafeBase = upstream.URL; c.TypeSafeModel = "jev-latest" })
-	handler := requireKey(cfg, handleSystemOne(cfg))
+	handler := requireKey(cfg, handleSystemOne(cfg, testStore(cfg)))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/systemone", strings.NewReader(`{"state":"it crashes","questions":{"is_bug":{"type":"noul","instructions":"bug?"}}}`))
 	req.Header.Set("Authorization", "Bearer test-key")
@@ -98,7 +102,7 @@ func TestEmbeddingsMapsUnknownModel(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := testConfig(func(c *config) { c.MistralBase = upstream.URL; c.MistralEmbed = "mistral-embed" })
-	handler := requireKey(cfg, handleEmbeddings(cfg))
+	handler := requireKey(cfg, handleEmbeddings(cfg, testStore(cfg)))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"model":"text-embedding-3-small","input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer test-key")
@@ -125,7 +129,7 @@ func TestEmbeddingsKeepsMistralModel(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := testConfig(func(c *config) { c.MistralBase = upstream.URL })
-	handler := requireKey(cfg, handleEmbeddings(cfg))
+	handler := requireKey(cfg, handleEmbeddings(cfg, testStore(cfg)))
 	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"model":"mistral-embed","input":["a"]}`))
 	req.Header.Set("Authorization", "Bearer test-key")
 	handler.ServeHTTP(httptest.NewRecorder(), req)
@@ -154,7 +158,7 @@ func TestTranscriptionsInjectsDefaultModel(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := testConfig(func(c *config) { c.GroqBase = upstream.URL; c.GroqSTT = "whisper-large-v3" })
-	handler := requireKey(cfg, handleTranscriptions(cfg))
+	handler := requireKey(cfg, handleTranscriptions(cfg, testStore(cfg), newDynLimiter(2)))
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -243,7 +247,7 @@ func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func TestEmbeddingsRejectsJSONNull(t *testing.T) {
 	cfg := testConfig()
-	handler := requireKey(cfg, handleEmbeddings(cfg))
+	handler := requireKey(cfg, handleEmbeddings(cfg, testStore(cfg)))
 	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader("null"))
 	req.Header.Set("Authorization", "Bearer test-key")
 	rec := httptest.NewRecorder()

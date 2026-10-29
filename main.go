@@ -55,6 +55,8 @@ type config struct {
 	GroqBase      string
 	GroqSTT       string
 	MaxUploads    int
+	AdminToken    string
+	ConfigFile    string
 }
 
 func env(key, fallback string) string {
@@ -79,6 +81,8 @@ func loadConfig() config {
 		GroqBase:      env("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
 		GroqSTT:       env("GROQ_STT_MODEL", "whisper-large-v3"),
 		MaxUploads:    envInt("MAX_CONCURRENT_TRANSCRIPTIONS", defaultTranscriptions),
+		AdminToken:    os.Getenv("EDGE_ADMIN_TOKEN"),
+		ConfigFile:    env("EDGE_CONFIG_FILE", "/data/edge-config.json"),
 	}
 }
 
@@ -99,14 +103,24 @@ func main() {
 		log.Fatal("CPA_API_KEY is required: the added endpoints authenticate against it")
 	}
 
+	started := time.Now()
+	store := newSettingsStore(cfg.ConfigFile, defaultSettings(cfg))
+	limiter := newDynLimiter(store.get().Transcriptions.MaxConcurrent)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, "ok\n")
 	})
-	mux.Handle("/v1/systemone", requireKey(cfg, handleSystemOne(cfg)))
-	mux.Handle("/v1/embeddings", requireKey(cfg, handleEmbeddings(cfg)))
-	mux.Handle("/v1/audio/transcriptions", requireKey(cfg, handleTranscriptions(cfg)))
+	mux.Handle("/v1/systemone", requireKey(cfg, handleSystemOne(cfg, store)))
+	mux.Handle("/v1/embeddings", requireKey(cfg, handleEmbeddings(cfg, store)))
+	mux.Handle("/v1/audio/transcriptions", requireKey(cfg, handleTranscriptions(cfg, store, limiter)))
+	// The management UI talks to /v8/management; older clients use /v0. Serve both.
+	for _, prefix := range []string{"/v0/management", "/v8/management"} {
+		mux.Handle(prefix+"/edge-admin/status", requireAdmin(cfg, handleAdminStatus(cfg, store, started)))
+		mux.Handle(prefix+"/edge-admin/config", requireAdmin(cfg, handleAdminConfig(store, limiter)))
+		mux.Handle(prefix+"/edge-admin/models", requireAdmin(cfg, handleAdminModels(cfg)))
+	}
 	mux.Handle("/", newProxy(upstream))
 
 	server := &http.Server{
@@ -241,10 +255,15 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 // handleSystemOne forwards TypeSafe Jev requests. Jev answers typed questions
 // about supplied state and returns calibrated probabilities, so the body is
 // passed through almost verbatim; only a missing model is defaulted.
-func handleSystemOne(cfg config) http.HandlerFunc {
+func handleSystemOne(cfg config, store *settingsStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		settings := store.get().TypeSafe
+		if !settings.Enabled {
+			writeError(w, http.StatusServiceUnavailable, "disabled", "the systemone endpoint is disabled in the dashboard")
 			return
 		}
 		if cfg.TypeSafeKey == "" {
@@ -256,7 +275,7 @@ func handleSystemOne(cfg config) http.HandlerFunc {
 			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", errRead.Error())
 			return
 		}
-		body = ensureModel(body, cfg.TypeSafeModel)
+		body = ensureModel(body, settings.Model)
 
 		status, headers, respBody, errDo := doWithRetry(r.Context(), func() (*http.Request, error) {
 			return newJSONRequest(r.Context(), cfg.TypeSafeBase+"/v1/systemone", cfg.TypeSafeKey, body)
@@ -272,10 +291,15 @@ func handleSystemOne(cfg config) http.HandlerFunc {
 
 // handleEmbeddings maps OpenAI-style embedding requests onto Mistral's
 // /v1/embeddings endpoint, which is the embedding provider configured here.
-func handleEmbeddings(cfg config) http.HandlerFunc {
+func handleEmbeddings(cfg config, store *settingsStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		settings := store.get().Embeddings
+		if !settings.Enabled {
+			writeError(w, http.StatusServiceUnavailable, "disabled", "the embeddings endpoint is disabled in the dashboard")
 			return
 		}
 		if cfg.MistralKey == "" {
@@ -294,7 +318,7 @@ func handleEmbeddings(cfg config) http.HandlerFunc {
 		}
 		model := strings.TrimSpace(jsonString(payload["model"]))
 		if !strings.HasPrefix(strings.ToLower(model), "mistral") {
-			modelJSON, _ := json.Marshal(cfg.MistralEmbed)
+			modelJSON, _ := json.Marshal(settings.Model)
 			payload["model"] = modelJSON
 		}
 		rewritten, errMarshal := json.Marshal(payload)
@@ -318,24 +342,28 @@ func handleEmbeddings(cfg config) http.HandlerFunc {
 // handleTranscriptions forwards multipart audio to Groq's Whisper endpoint,
 // defaulting the model when the client did not send one. A semaphore bounds how
 // many uploads are buffered at once so a burst cannot exhaust the container.
-func handleTranscriptions(cfg config) http.HandlerFunc {
-	semaphore := make(chan struct{}, cfg.MaxUploads)
+func handleTranscriptions(cfg config, store *settingsStore, limiter *dynLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		settings := store.get().Transcriptions
+		if !settings.Enabled {
+			writeError(w, http.StatusServiceUnavailable, "disabled", "the transcription endpoint is disabled in the dashboard")
 			return
 		}
 		if cfg.GroqKey == "" {
 			writeError(w, http.StatusServiceUnavailable, "not_configured", "GROQ_API_KEY is not configured")
 			return
 		}
-		select {
-		case semaphore <- struct{}{}:
-			defer func() { <-semaphore }()
-		case <-r.Context().Done():
+		limiter.ensureCapacity(settings.MaxConcurrent)
+		release, okAcquire := limiter.acquire(r.Context())
+		if !okAcquire {
 			writeError(w, http.StatusRequestTimeout, "request_cancelled", "request cancelled")
 			return
 		}
+		defer release()
 
 		body, errRead := readLimited(r, maxUploadBody)
 		if errRead != nil {
@@ -346,7 +374,7 @@ func handleTranscriptions(cfg config) http.HandlerFunc {
 			writeError(w, status, "invalid_upload", errRead.Error())
 			return
 		}
-		rewritten, contentType, errRewrite := withDefaultFormField(body, r.Header.Get("Content-Type"), "model", cfg.GroqSTT)
+		rewritten, contentType, errRewrite := withDefaultFormField(body, r.Header.Get("Content-Type"), "model", settings.Model)
 		if errRewrite != nil {
 			writeError(w, http.StatusBadRequest, "invalid_multipart", errRewrite.Error())
 			return
